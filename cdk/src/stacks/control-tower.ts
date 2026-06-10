@@ -1,10 +1,11 @@
-import { CfnParameter, NestedStack, NestedStackProps, RemovalPolicy, aws_iam as iam } from 'aws-cdk-lib';
+import { CfnParameter, NestedStack, NestedStackProps, RemovalPolicy, Stack, aws_iam as iam } from 'aws-cdk-lib';
 import { CfnLandingZone } from 'aws-cdk-lib/aws-controltower';
 import { CfnRole } from 'aws-cdk-lib/aws-iam';
 import { CfnAccount } from 'aws-cdk-lib/aws-organizations';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
 import { PrepareStack } from './prepare';
+import { ControlTowerPrerequisites } from '../constructs/control-tower-prerequisites';
 import { SuperwerkerBootstrap } from '../constructs/superwerker-bootstrap';
 
 export class ControlTowerStack extends NestedStack {
@@ -76,6 +77,11 @@ export class ControlTowerStack extends NestedStack {
       roleName: 'AWSControlTowerCloudTrailRole',
       assumedBy: new iam.ServicePrincipal('cloudtrail.amazonaws.com'),
       path: '/service-role/',
+      // Control Tower landing zone v4.0 validates that this role carries the AWS managed
+      // policy AWSControlTowerCloudTrailRolePolicy; an inline policy of the same name is no
+      // longer accepted ("does not exist or have sufficient permissions"). The inline policy
+      // below is kept for backward parity with the documented setup.
+      managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSControlTowerCloudTrailRolePolicy')],
       inlinePolicies: {
         AWSControlTowerCloudTrailRolePolicy: new iam.PolicyDocument({
           statements: [
@@ -149,34 +155,34 @@ export class ControlTowerStack extends NestedStack {
       },
     ).stringValue;
 
-    const SECURITY_OU_NAME = ssm.StringParameter.fromStringParameterAttributes(this, 'SecurityOuParameterLookup', {
-      parameterName: PrepareStack.controlTowerSecurityOuSsmParameter,
-      forceDynamicReference: true,
-    }).stringValue;
-
-    const SANDBOX_OU_NAME = ssm.StringParameter.fromStringParameterAttributes(this, 'SandboxOuParameterLookup', {
-      parameterName: PrepareStack.controlTowerSandboxOuSsmParameter,
-      forceDynamicReference: true,
-    }).stringValue;
+    // Control Tower landing zone v4.0 no longer provisions the Security OU or the
+    // AWSControlTowerExecution roles for pre-existing (Organizations-created) shared accounts.
+    // Ensure those prerequisites exist before creating the landing zone.
+    const controlTowerPrerequisites = new ControlTowerPrerequisites(this, 'ControlTowerPrerequisites', {
+      auditAccountId: auditAccount.attrAccountId,
+      logArchiveAccountId: logArchiveAccount.attrAccountId,
+      managementAccountId: Stack.of(this).account,
+      securityOuName: 'Security',
+    });
+    controlTowerPrerequisites.node.addDependency(auditAccount);
+    controlTowerPrerequisites.node.addDependency(logArchiveAccount);
 
     const landingZone = new CfnLandingZone(this, 'LandingZone', {
       manifest: {
         governedRegions: ctGovernedRegions,
-        organizationStructure: {
-          security: {
-            name: SECURITY_OU_NAME,
-          },
-          sandbox: {
-            name: SANDBOX_OU_NAME,
-          },
-        },
-        securityRoles: {
-          accountId: auditAccount.attrAccountId,
-        },
+        // `organizationStructure` was removed in Control Tower landing zone v4.0;
+        // OU layout is now managed directly in AWS Organizations. Sending it makes the
+        // v4.0 manifest fail with "contains fields that are not recognized".
         accessManagement: {
           enabled: true,
         },
+        securityRoles: {
+          // v4.0 requires an explicit `enabled` flag on every service integration.
+          enabled: true,
+          accountId: auditAccount.attrAccountId,
+        },
         centralizedLogging: {
+          enabled: true,
           accountId: logArchiveAccount.attrAccountId,
           configurations: {
             loggingBucket: {
@@ -187,7 +193,27 @@ export class ControlTowerStack extends NestedStack {
             },
             kmsKeyArn: ctKmsKeyArn,
           },
+        },
+        config: {
+          // New in v4.0: AWS Config is an explicit integration. Kept enabled with the
+          // aggregator in the Audit account to match v3.x behaviour. Disabling it would
+          // force disabling securityRoles/accessManagement/backup as well.
           enabled: true,
+          accountId: auditAccount.attrAccountId,
+          configurations: {
+            loggingBucket: {
+              retentionDays: ctBucketRetetionLogging,
+            },
+            accessLoggingBucket: {
+              retentionDays: ctBucketRetetionAccessLogging,
+            },
+            kmsKeyArn: ctKmsKeyArn,
+          },
+        },
+        backup: {
+          // superwerker provides AWS Backup through its own Backup stack (organization
+          // backup policies), not the Control Tower backup integration, so this stays off.
+          enabled: false,
         },
       },
       version: ctVersion,
@@ -206,6 +232,7 @@ export class ControlTowerStack extends NestedStack {
       controlTowerConfigAggregatorRole,
       logArchiveAccount,
       auditAccount,
+      controlTowerPrerequisites,
     );
 
     //create function to trigger enabling of features after landing zone has been installed
